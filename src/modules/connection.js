@@ -10,6 +10,13 @@ import { TelnetSocket } from "telnet-stream";
 /** @typedef {import("../plugin").PluginContext} PluginContext */
 /** @typedef {import("./tracker").ReceiverInfo} ReceiverInfo */
 
+const TELNET_PORT = 23;
+const HTTP_PORT = 80;
+const HTTP_COMMAND_PATH = "/goform/formiPhoneAppDirect.xml";
+const HTTP_STATUS_PATH = "/goform/formMainZone_MainZoneXmlStatus.xml";
+const HTTP_STATUS_Z2_PATH = "/goform/formZone2_Zone2XmlStatus.xml";
+const HTTP_POLL_INTERVAL = 5000;
+
 /**
  * @typedef {Object} ReceiverEvent
  * @property { "connected" 
@@ -146,6 +153,18 @@ export class AVRConnection {
 	#reconnectCount = 0;
 
 	/**
+	 * The connection mode: "telnet" (port 23) or "http" (port 80 HTTP API)
+	 * @type {"telnet" | "http"}
+	 */
+	#mode = "telnet";
+
+	/**
+	 * The HTTP polling timer (used in HTTP mode)
+	 * @type {NodeJS.Timeout | undefined}
+	 */
+	#pollTimer;
+
+	/**
 	 * The host address of the receiver
 	 * @type {string}
 	 */
@@ -176,12 +195,18 @@ export class AVRConnection {
 	}
 
 	/**
-	 * Connect to a receiver
+	 * Connect to a receiver. Tries telnet (port 23) first; if refused, falls back to HTTP API (port 80).
 	 */
 	async connect() {
-		this.logger.debug(`Connecting to Denon receiver: ${this.#host}`);
+		if (this.#mode === "http") {
+			return this.#connectHttp();
+		}
 
-		let rawSocket = net.createConnection(23, this.#host);
+		this.logger.debug(`Connecting to Denon receiver via telnet: ${this.#host}:${TELNET_PORT}`);
+		this.status.statusMsg = "Connecting...";
+		this.emit("status");
+
+		let rawSocket = net.createConnection(TELNET_PORT, this.#host);
 		let telnet = new TelnetSocket(rawSocket);
 
 		// Connection lifecycle events
@@ -202,6 +227,145 @@ export class AVRConnection {
 	}
 
 	/**
+	 * Connect via HTTP API (fallback for receivers with telnet disabled)
+	 */
+	async #connectHttp() {
+		this.logger.info(`Connecting to Denon receiver via HTTP API: ${this.#host}:${HTTP_PORT}`);
+		this.status.statusMsg = "Connecting (HTTP)...";
+		this.emit("status");
+
+		try {
+			// Verify the receiver is reachable via HTTP
+			const response = await fetch(`http://${this.#host}:${HTTP_PORT}${HTTP_STATUS_PATH}`);
+			if (!response.ok) {
+				this.status.statusMsg = `HTTP connection failed: ${response.status}`;
+				this.logger.warn(this.status.statusMsg);
+				this.emit("status");
+				return;
+			}
+
+			this.#reconnectCount = 0;
+			this.status.statusMsg = "Connected (HTTP).";
+			this.logger.info(`Connected to Denon receiver via HTTP API at ${this.#host}`);
+
+			this.emit("connected");
+
+			// Request full status via HTTP
+			await this.#pollHttpStatus();
+
+			// Start polling for status updates
+			this.#pollTimer = setInterval(() => this.#pollHttpStatus(), HTTP_POLL_INTERVAL);
+		} catch (error) {
+			this.status.statusMsg = `HTTP connection error: ${error.message}`;
+			this.logger.warn(this.status.statusMsg);
+			this.emit("status");
+
+			// Retry with backoff
+			if (this.#reconnectCount < 10) {
+				this.#reconnectCount++;
+				await setTimeout(2000);
+				this.#connectHttp();
+			}
+		}
+	}
+
+	/**
+	 * Poll receiver status via HTTP XML API
+	 */
+	async #pollHttpStatus() {
+		try {
+			// Poll main zone
+			const mainResp = await fetch(`http://${this.#host}:${HTTP_PORT}${HTTP_STATUS_PATH}`);
+			if (mainResp.ok) {
+				const xml = await mainResp.text();
+				this.#parseHttpStatusXml(xml, 0);
+			}
+
+			// Poll zone 2
+			const z2Resp = await fetch(`http://${this.#host}:${HTTP_PORT}${HTTP_STATUS_Z2_PATH}`);
+			if (z2Resp.ok) {
+				const xml = await z2Resp.text();
+				this.#parseHttpStatusXml(xml, 1);
+			}
+		} catch (error) {
+			this.logger.warn(`HTTP status poll failed: ${error.message}`);
+		}
+	}
+
+	/**
+	 * Parse HTTP status XML response and update internal state
+	 * @param {string} xml - The XML response body
+	 * @param {number} zone - The zone index (0 = main, 1 = zone 2)
+	 */
+	#parseHttpStatusXml(xml, zone) {
+		const status = this.status.zones[zone];
+
+		// Parse power
+		const powerMatch = xml.match(/<Power><value>(.+?)<\/value><\/Power>/);
+		if (powerMatch) {
+			const newPower = powerMatch[1] === "ON";
+			if (newPower !== status.power) {
+				status.power = newPower;
+				this.emit("powerChanged", zone);
+			}
+		}
+
+		// Parse volume
+		const volMatch = xml.match(/<MasterVolume><value>(.+?)<\/value><\/MasterVolume>/);
+		if (volMatch) {
+			// HTTP API returns volume as e.g. "-40.0" (dB), convert to the 0-98 scale
+			const dbValue = parseFloat(volMatch[1]);
+			const newVolume = Math.round(dbValue + 80); // -80dB = 0, 0dB = 80
+			if (newVolume !== status.volume) {
+				status.volume = newVolume;
+				this.emit("volumeChanged", zone);
+			}
+		}
+
+		// Parse mute
+		const muteMatch = xml.match(/<Mute><value>(.+?)<\/value><\/Mute>/);
+		if (muteMatch) {
+			const newMute = muteMatch[1] === "on";
+			if (newMute !== status.muted) {
+				status.muted = newMute;
+				this.emit("muteChanged", zone);
+			}
+		}
+
+		// Parse source (main zone only)
+		if (zone === 0) {
+			const srcMatch = xml.match(/<InputFuncSelect><value>(.+?)<\/value><\/InputFuncSelect>/);
+			if (srcMatch && srcMatch[1] !== status.source) {
+				status.source = srcMatch[1];
+				this.emit("sourceChanged", zone);
+			}
+		}
+	}
+
+	/**
+	 * Send a command via HTTP API
+	 * @param {string} command - The AVR command string (e.g. "PWON", "MV50")
+	 * @returns {Promise<boolean>} Whether the command was sent successfully
+	 */
+	async #sendHttpCommand(command) {
+		try {
+			const url = `http://${this.#host}:${HTTP_PORT}${HTTP_COMMAND_PATH}?${encodeURIComponent(command)}`;
+			const response = await fetch(url);
+			if (!response.ok) {
+				this.logger.warn(`HTTP command failed (${response.status}): ${command}`);
+				return false;
+			}
+			this.logger.debug(`Sent HTTP command: ${command}`);
+			// Poll immediately after sending a command to get updated state
+			this.#pollHttpStatus();
+			return true;
+		} catch (error) {
+			this.logger.error(`Error sending HTTP command: ${error.message}`);
+			return false;
+		}
+	}
+
+	/**
 	 * Disconnect from the receiver and clean up resources
 	 */
 	disconnect() {
@@ -210,6 +374,12 @@ export class AVRConnection {
 
 		// Clear the listeners for this instance
 		this.#listenerIds = [];
+
+		// Clear HTTP polling timer
+		if (this.#pollTimer) {
+			clearInterval(this.#pollTimer);
+			this.#pollTimer = undefined;
+		}
 
 		// Dispose of this instance's sockets
 		this.#rawSocket = undefined;
@@ -235,33 +405,23 @@ export class AVRConnection {
 	 * @returns {boolean} Whether the command was sent successfully
 	 */
 	changeVolume(delta, zone = 0) {
-		const telnet = this.#telnet;
 		const status = this.status.zones[zone];
+		if (!status.power || status.volume === undefined) return false;
 
-		if (!telnet || !status.power || status.volume === undefined) return false;
+		let command = ["MV", "Z2"][zone];
 
-		try {
-			let command = ["MV", "Z2"][zone];
-
-			if (delta === 1) {
-				command += "UP";
-			} else if (delta === -1) {
-				command += "DOWN";
-			} else {
-				let newVolumeStr = Math.max(0, Math.min(status.maxVolume, Math.round(status.volume + delta)))
-					.toString()
-					.padStart(2, "0");
-				command += newVolumeStr;
-			}
-
-			telnet.write(command + "\r");
-			this.logger.debug(`Sent volume command: ${command}`);
-		} catch (error) {
-			this.logger.error(`Error sending volume command: ${error.message}`);
-			return false;
+		if (delta === 1) {
+			command += "UP";
+		} else if (delta === -1) {
+			command += "DOWN";
+		} else {
+			let newVolumeStr = Math.max(0, Math.min(status.maxVolume, Math.round(status.volume + delta)))
+				.toString()
+				.padStart(2, "0");
+			command += newVolumeStr;
 		}
 
-		return true;
+		return this.#sendCommand(command);
 	}
 
 	/**
@@ -271,57 +431,29 @@ export class AVRConnection {
 	 * @returns {boolean} Whether the command was sent successfully
 	 */
 	changeVolumeAbsolute(value, zone = 0) {
-		const telnet = this.#telnet;
 		const status = this.status.zones[zone];
+		if (!status.power) return false;
 
-		if (!telnet || !status.power) return false;
+		let command = ["MV", "Z2"][zone];
+		command += value.toString().padStart(2, "0");
 
-		try {
-			let command = ["MV", "Z2"][zone];
-			command += value.toString().padStart(2, "0");
-
-			telnet.write(command + "\r");
-			this.logger.debug(`Sent volume command: ${command}`);
-		} catch (error) {
-			this.logger.error(`Error sending volume command: ${error.message}`);
-			return false;
-		}
-
-		return true;
+		return this.#sendCommand(command);
 	}
 
 	changeVolumeUp(zone = 0) {
-		const telnet = this.#telnet;
 		const status = this.status.zones[zone];
+		if (!status.power) return false;
 
-		if (!telnet || !status.power) return false;
-
-		try {
-			let command = ["MV", "Z2"][zone]+"UP";
-
-			telnet.write(command + "\r");
-			this.logger.debug(`Sent volume command: ${command}`);
-		} catch (error) {
-			this.logger.error(`Error sending volume command: ${error.message}`);
-			return false;
-		}
+		let command = ["MV", "Z2"][zone]+"UP";
+		return this.#sendCommand(command);
 	}
 
 	changeVolumeDown(zone = 0) {
-		const telnet = this.#telnet;
 		const status = this.status.zones[zone];
+		if (!status.power) return false;
 
-		if (!telnet || !status.power) return false;
-
-		try {
-			let command = ["MV", "Z2"][zone]+"DOWN";
-
-			telnet.write(command + "\r");
-			this.logger.debug(`Sent volume command: ${command}`);
-		} catch (error) {
-			this.logger.error(`Error sending volume command: ${error.message}`);
-			return false;
-		}
+		let command = ["MV", "Z2"][zone]+"DOWN";
+		return this.#sendCommand(command);
 	}
 
 	/**
@@ -331,23 +463,20 @@ export class AVRConnection {
 	 * @returns {boolean} Whether the command was sent successfully
 	 */
 	setMute(value, zone = 0) {
-		const telnet = this.#telnet;
 		const status = this.status.zones[zone];
-
-		if (!telnet || !status.power) return false;
+		if (!status.power) return false;
 
 		if (value === undefined) value = !status.muted;
 
 		let command = ["MU", "Z2MU"][zone];
 		command += value ? "ON" : "OFF";
 
-		telnet.write(command + "\r");
-		this.logger.debug(`Sent mute command: ${command}`);
+		this.#sendCommand(command);
 
 		// Refresh the mute status to avoid synchronization issues
-		command = "?";
-		telnet.write(command + "\r");
-		this.logger.debug(`Sent mute status request: ${command}`);
+		if (this.#mode === "telnet") {
+			this.#sendCommand("MU?");
+		}
 
 		return true;
 	}
@@ -359,20 +488,14 @@ export class AVRConnection {
 	 * @returns {boolean} Whether the command was sent successfully
 	 */
 	setPower(value, zone = 0) {
-		const telnet = this.#telnet;
 		const status = this.status.zones[zone];
-
-		if (!telnet) return false;
 
 		if (value === undefined) value = !status.power;
 
 		let command = ["PW", "Z2"][zone];
 		command += value ? "ON" : ["STANDBY", "OFF"][zone];
 
-		telnet.write(command + "\r");
-		this.logger.debug(`Sent power command: ${command}`);
-
-		return true;
+		return this.#sendCommand(command);
 	}
 
 	/**
@@ -382,16 +505,12 @@ export class AVRConnection {
 	 * @returns {boolean} Whether the command was sent successfully
 	 */
 	setSource(value, zone = 0) {
-		const telnet = this.#telnet;
-		if (!telnet || !value) return false;
+		if (!value) return false;
 
 		let command = ["SI", "Z2"][zone];
 		command += value;
 
-		telnet.write(command + "\r");
-		this.logger.debug(`Sent source command: ${command}`);
-
-		return true;
+		return this.#sendCommand(command);
 	}
 
 	/**
@@ -400,16 +519,12 @@ export class AVRConnection {
 	 * @returns {boolean} Whether the command was sent successfully
 	 */
 	setVideoSelectSource(value) {
-		const telnet = this.#telnet;
-		if (!telnet || !value) return false;
+		if (!value) return false;
 
 		let command = "SV";
 		command += value;
 
-		telnet.write(command + "\r");
-		this.logger.debug(`Sent video select source command: ${command}`);
-
-		return true;
+		return this.#sendCommand(command);
 	}
 
 	/**
@@ -418,14 +533,33 @@ export class AVRConnection {
 	 * @returns {boolean} Whether the command was sent successfully
 	 */
 	setDynamicVolume(value) {
-		const telnet = this.#telnet;
-		if (!telnet) return false;
-
 		let command = "PSDYNVOL ";
 		command += value;
 
-		telnet.write(command + "\r");
-		this.logger.debug(`Sent dynamic volume command: ${command}`);
+		return this.#sendCommand(command);
+	}
+
+	/**
+	 * Send a command to the receiver using the current connection mode
+	 * @param {string} command - The AVR command string
+	 * @returns {boolean} Whether the command was sent (or queued) successfully
+	 */
+	#sendCommand(command) {
+		if (this.#mode === "http") {
+			this.#sendHttpCommand(command);
+			return true;
+		}
+
+		const telnet = this.#telnet;
+		if (!telnet) return false;
+
+		try {
+			telnet.write(command + "\r");
+			this.logger.debug(`Sent telnet command: ${command}`);
+		} catch (error) {
+			this.logger.error(`Error sending telnet command: ${error.message}`);
+			return false;
+		}
 
 		return true;
 	}
@@ -684,6 +818,14 @@ export class AVRConnection {
 			// If the host can't be looked up, give up.
 			status.statusMsg = `Host not found: ${this.#host}`;
 			this.disconnect();
+		} else if (error.code === "ECONNREFUSED" && this.#mode === "telnet") {
+			// Telnet port 23 is refused — fall back to HTTP API (port 80)
+			this.logger.info(`Telnet connection refused at ${this.#host}:${TELNET_PORT}, falling back to HTTP API.`);
+			this.disconnect();
+			this.#mode = "http";
+			this.#reconnectCount = 0;
+			this.#connectHttp();
+			return;
 		} else {
 			status.statusMsg = `Connection error: ${error.message} (${error.code})`;
 		}
@@ -694,9 +836,11 @@ export class AVRConnection {
 
 	/**
 	 * Request the full status of the receiver
-	 * Usually only needed when the connection is first established
+	 * Usually only needed when the connection is first established (telnet mode)
 	 */
 	#requestFullReceiverStatus() {
+		if (this.#mode !== "telnet") return;
+
 		const telnet = this.#telnet;
 		if (!telnet) return;
 
