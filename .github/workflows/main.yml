@@ -8,11 +8,11 @@ on:
       - main
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
-    name: Build, Pack and Upload
+    name: Build, Pack and Release
     runs-on: ubuntu-latest
 
     steps:
@@ -22,7 +22,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20.18.1
+          node-version: 22
           cache: npm
           cache-dependency-path: package-lock.json
 
@@ -41,13 +41,17 @@ jobs:
       - name: Verify generated package
         run: |
           echo "Generated files:"
-          ls -lah
-          find . -name "*.streamDeckPlugin"
+          ls -lah *.streamDeckPlugin
 
-      - name: Upload package
-        uses: actions/upload-artifact@v4
+      - name: Get version from package.json
+        id: version
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: stream-deck-plugin
-          path: "*.streamDeckPlugin"
-          if-no-files-found: error
-          retention-days: 30
+          tag_name: v${{ steps.version.outputs.version }}
+          name: v${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          make_latest: true
+          files: "*.streamDeckPlugin"
