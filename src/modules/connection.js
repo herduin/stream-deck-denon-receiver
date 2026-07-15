@@ -12,10 +12,12 @@ import { TelnetSocket } from "telnet-stream";
 
 const TELNET_PORT = 23;
 const HTTP_PORT = 80;
+const HEOS_PORT = 1255;
 const HTTP_COMMAND_PATH = "/goform/formiPhoneAppDirect.xml";
 const HTTP_STATUS_PATH = "/goform/formMainZone_MainZoneXmlStatus.xml";
 const HTTP_STATUS_Z2_PATH = "/goform/formZone2_Zone2XmlStatus.xml";
 const HTTP_POLL_INTERVAL = 5000;
+const HEOS_POLL_INTERVAL = 5000;
 
 /**
  * @typedef {Object} ReceiverEvent
@@ -153,16 +155,34 @@ export class AVRConnection {
 	#reconnectCount = 0;
 
 	/**
-	 * The connection mode: "telnet" (port 23) or "http" (port 80 HTTP API)
-	 * @type {"telnet" | "http"}
+	 * The connection mode: "telnet" (port 23), "http" (port 80 HTTP API), or "heos" (port 1255 HEOS CLI)
+	 * @type {"telnet" | "http" | "heos"}
 	 */
 	#mode = "telnet";
 
 	/**
-	 * The HTTP polling timer (used in HTTP mode)
+	 * The HTTP/HEOS polling timer
 	 * @type {NodeJS.Timeout | undefined}
 	 */
 	#pollTimer;
+
+	/**
+	 * The HEOS player ID (used in HEOS mode)
+	 * @type {number | undefined}
+	 */
+	#heosPlayerId;
+
+	/**
+	 * The HEOS telnet socket (used in HEOS mode)
+	 * @type {TelnetSocket | undefined}
+	 */
+	#heosTelnet;
+
+	/**
+	 * The HEOS raw socket (used in HEOS mode)
+	 * @type {net.Socket | undefined}
+	 */
+	#heosRawSocket;
 
 	/**
 	 * The host address of the receiver
@@ -195,11 +215,14 @@ export class AVRConnection {
 	}
 
 	/**
-	 * Connect to a receiver. Tries telnet (port 23) first; if refused, falls back to HTTP API (port 80).
+	 * Connect to a receiver. Tries telnet (port 23) first; if refused, falls back to HTTP API (port 80), then HEOS CLI (port 1255).
 	 */
 	async connect() {
 		if (this.#mode === "http") {
 			return this.#connectHttp();
+		}
+		if (this.#mode === "heos") {
+			return this.#connectHeos();
 		}
 
 		this.logger.debug(`Connecting to Denon receiver via telnet: ${this.#host}:${TELNET_PORT}`);
@@ -260,12 +283,11 @@ export class AVRConnection {
 			this.logger.warn(this.status.statusMsg);
 			this.emit("status");
 
-			// Retry with backoff
-			if (this.#reconnectCount < 10) {
-				this.#reconnectCount++;
-				await setTimeout(2000);
-				this.#connectHttp();
-			}
+			// HTTP failed — fall back to HEOS CLI (port 1255)
+			this.logger.info(`HTTP API unavailable at ${this.#host}, falling back to HEOS CLI.`);
+			this.#mode = "heos";
+			this.#reconnectCount = 0;
+			this.#connectHeos();
 		}
 	}
 
@@ -366,6 +388,193 @@ export class AVRConnection {
 	}
 
 	/**
+	 * Connect via HEOS CLI (for Denon Home speakers and other HEOS-only devices)
+	 */
+	async #connectHeos() {
+		this.logger.info(`Connecting to device via HEOS CLI: ${this.#host}:${HEOS_PORT}`);
+		this.status.statusMsg = "Connecting (HEOS)...";
+		this.emit("status");
+
+		try {
+			const socket = net.createConnection(HEOS_PORT, this.#host);
+			const telnet = new TelnetSocket(socket);
+
+			// Ignore standard telnet negotiation
+			telnet.on("do", (option) => telnet.writeWont(option));
+			telnet.on("will", (option) => telnet.writeDont(option));
+
+			/** @type {string} */
+			let buffer = "";
+
+			await new Promise((resolve, reject) => {
+				const timeout = setTimeout(5000).then(() => {
+					reject(new Error("HEOS connection timeout"));
+				});
+
+				socket.on("error", (err) => reject(err));
+
+				telnet.on("connect", () => {
+					// Register for change events and get players
+					telnet.write("heos://system/register_for_change_events?enable=on\r\n");
+					telnet.write("heos://player/get_players\r\n");
+				});
+
+				telnet.on("data", (data) => {
+					buffer += data.toString();
+					const lines = buffer.split("\r\n");
+					buffer = lines.pop() || "";
+
+					for (const line of lines) {
+						if (!line) continue;
+						try {
+							const response = JSON.parse(line);
+							if (response.heos?.command === "player/get_players" && response.heos?.result === "success") {
+								const player = response.payload?.find((p) => p.ip === this.#host);
+								if (player) {
+									this.#heosPlayerId = player.pid;
+									resolve(undefined);
+								} else {
+									reject(new Error(`No HEOS player found at ${this.#host}`));
+								}
+							}
+						} catch (e) {
+							// Not JSON yet, continue buffering
+						}
+					}
+				});
+			});
+
+			this.#heosRawSocket = socket;
+			this.#heosTelnet = telnet;
+			this.#reconnectCount = 0;
+			this.status.statusMsg = "Connected (HEOS).";
+			this.logger.info(`Connected to HEOS device at ${this.#host}, player ID: ${this.#heosPlayerId}`);
+			this.emit("connected");
+
+			// HEOS devices are always "on" when reachable
+			this.status.zones[0].power = true;
+			this.status.zones[0].maxVolume = 100;
+			this.emit("powerChanged", 0);
+
+			// Set up ongoing event listener
+			let eventBuffer = "";
+			telnet.on("data", (data) => {
+				eventBuffer += data.toString();
+				const lines = eventBuffer.split("\r\n");
+				eventBuffer = lines.pop() || "";
+				for (const line of lines) {
+					if (line) this.#onHeosData(line);
+				}
+			});
+
+			// Poll for initial status
+			await this.#pollHeosStatus();
+
+			// Start polling
+			this.#pollTimer = setInterval(() => this.#pollHeosStatus(), HEOS_POLL_INTERVAL);
+
+		} catch (error) {
+			this.status.statusMsg = `HEOS connection error: ${error.message}`;
+			this.logger.warn(this.status.statusMsg);
+			this.emit("status");
+
+			if (this.#reconnectCount < 10) {
+				this.#reconnectCount++;
+				await setTimeout(3000);
+				this.#connectHeos();
+			}
+		}
+	}
+
+	/**
+	 * Handle incoming HEOS event data
+	 * @param {string} line - A single JSON line from the HEOS CLI
+	 */
+	#onHeosData(line) {
+		try {
+			const response = JSON.parse(line);
+			const command = response.heos?.command;
+			const message = response.heos?.message || "";
+
+			// Parse message params (key=value&key=value)
+			const params = Object.fromEntries(
+				message.split("&").map((p) => p.split("=")).filter((p) => p.length === 2)
+			);
+
+			if (command === "event/player_volume_changed") {
+				if (parseInt(params.pid) === this.#heosPlayerId) {
+					const newVolume = parseInt(params.level);
+					const muted = params.mute === "on";
+					const status = this.status.zones[0];
+					if (newVolume !== status.volume) {
+						status.volume = newVolume;
+						this.emit("volumeChanged", 0);
+					}
+					if (muted !== status.muted) {
+						status.muted = muted;
+						this.emit("muteChanged", 0);
+					}
+				}
+			} else if (command === "event/player_state_changed") {
+				if (parseInt(params.pid) === this.#heosPlayerId) {
+					// state: play, pause, stop — map to power
+					const status = this.status.zones[0];
+					const newPower = params.state === "play" || params.state === "pause";
+					if (newPower !== status.power) {
+						status.power = newPower;
+						this.emit("powerChanged", 0);
+					}
+				}
+			} else if (command === "player/get_volume" && response.heos?.result === "success") {
+				const level = parseInt(params.level);
+				const status = this.status.zones[0];
+				if (level !== status.volume) {
+					status.volume = level;
+					this.emit("volumeChanged", 0);
+				}
+			} else if (command === "player/get_mute" && response.heos?.result === "success") {
+				const muted = params.state === "on";
+				const status = this.status.zones[0];
+				if (muted !== status.muted) {
+					status.muted = muted;
+					this.emit("muteChanged", 0);
+				}
+			}
+		} catch (e) {
+			// Ignore unparseable lines
+		}
+	}
+
+	/**
+	 * Poll HEOS player status
+	 */
+	async #pollHeosStatus() {
+		const telnet = this.#heosTelnet;
+		if (!telnet || this.#heosPlayerId === undefined) return;
+
+		telnet.write(`heos://player/get_volume?pid=${this.#heosPlayerId}\r\n`);
+		telnet.write(`heos://player/get_mute?pid=${this.#heosPlayerId}\r\n`);
+	}
+
+	/**
+	 * Send a HEOS CLI command
+	 * @param {string} command - The full HEOS command URL
+	 */
+	#sendHeosCommand(command) {
+		const telnet = this.#heosTelnet;
+		if (!telnet) return false;
+
+		try {
+			telnet.write(`${command}\r\n`);
+			this.logger.debug(`Sent HEOS command: ${command}`);
+			return true;
+		} catch (error) {
+			this.logger.error(`Error sending HEOS command: ${error.message}`);
+			return false;
+		}
+	}
+
+	/**
 	 * Disconnect from the receiver and clean up resources
 	 */
 	disconnect() {
@@ -375,10 +584,20 @@ export class AVRConnection {
 		// Clear the listeners for this instance
 		this.#listenerIds = [];
 
-		// Clear HTTP polling timer
+		// Clear polling timer
 		if (this.#pollTimer) {
 			clearInterval(this.#pollTimer);
 			this.#pollTimer = undefined;
+		}
+
+		// Close HEOS connection
+		if (this.#heosTelnet) {
+			this.#heosTelnet.destroy();
+			this.#heosTelnet = undefined;
+		}
+		if (this.#heosRawSocket && !this.#heosRawSocket.destroyed) {
+			this.#heosRawSocket.destroy();
+			this.#heosRawSocket = undefined;
 		}
 
 		// Dispose of this instance's sockets
@@ -550,6 +769,10 @@ export class AVRConnection {
 			return true;
 		}
 
+		if (this.#mode === "heos") {
+			return this.#translateAndSendHeos(command);
+		}
+
 		const telnet = this.#telnet;
 		if (!telnet) return false;
 
@@ -562,6 +785,45 @@ export class AVRConnection {
 		}
 
 		return true;
+	}
+
+	/**
+	 * Translate an AVR command to a HEOS CLI command and send it
+	 * @param {string} command - The AVR command string
+	 * @returns {boolean} Whether the command was sent
+	 */
+	#translateAndSendHeos(command) {
+		const pid = this.#heosPlayerId;
+		if (pid === undefined) return false;
+
+		if (command === "PWON") {
+			// HEOS doesn't have true power on — already powered if reachable
+			this.status.zones[0].power = true;
+			this.emit("powerChanged", 0);
+			return true;
+		} else if (command === "PWSTANDBY") {
+			// No standby in HEOS, but we can stop playback
+			return this.#sendHeosCommand(`heos://player/set_play_state?pid=${pid}&state=stop`);
+		} else if (command === "MUON") {
+			return this.#sendHeosCommand(`heos://player/set_mute?pid=${pid}&state=on`);
+		} else if (command === "MUOFF") {
+			return this.#sendHeosCommand(`heos://player/set_mute?pid=${pid}&state=off`);
+		} else if (command === "MU?") {
+			return this.#sendHeosCommand(`heos://player/get_mute?pid=${pid}`);
+		} else if (command === "MVUP") {
+			return this.#sendHeosCommand(`heos://player/volume_up?pid=${pid}&step=2`);
+		} else if (command === "MVDOWN") {
+			return this.#sendHeosCommand(`heos://player/volume_down?pid=${pid}&step=2`);
+		} else if (command.startsWith("MV")) {
+			// MV50 → set volume to 50 (HEOS uses 0-100 scale)
+			const vol = parseInt(command.substring(2));
+			if (!isNaN(vol)) {
+				return this.#sendHeosCommand(`heos://player/set_volume?pid=${pid}&level=${vol}`);
+			}
+		}
+
+		this.logger.debug(`No HEOS translation for AVR command: ${command}`);
+		return false;
 	}
 
 	/** @typedef {(...args: any[]) => void} EventListener */
